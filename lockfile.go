@@ -32,12 +32,13 @@ func (t TemporaryError) Temporary() bool { return true }
 
 // Various errors returned by this package
 var (
-	ErrBusy          = TemporaryError("Locked by other process")             // If you get this, retry after a short sleep might help
-	ErrNotExist      = TemporaryError("Lockfile created, but doesn't exist") // If you get this, retry after a short sleep might help
-	ErrNeedAbsPath   = errors.New("Lockfiles must be given as absolute path names")
-	ErrInvalidPid    = errors.New("Lockfile contains invalid pid for system")
-	ErrDeadOwner     = errors.New("Lockfile contains pid of process not existent on this system anymore")
-	ErrRogueDeletion = errors.New("Lockfile owned by me has been removed unexpectedly")
+	ErrBusy            = TemporaryError("Locked by other process")                 // If you get this, retry after a short sleep might help
+	ErrBusyOnOtherHost = TemporaryError("Locked by other process on another host") // If you get this, retry after a short sleep might help
+	ErrNotExist        = TemporaryError("Lockfile created, but doesn't exist")     // If you get this, retry after a short sleep might help
+	ErrNeedAbsPath     = errors.New("lockfiles must be given as absolute path names")
+	ErrInvalidPid      = errors.New("lockfile contains invalid pid for system")
+	ErrDeadOwner       = errors.New("lockfile contains pid of process not existent on this system anymore")
+	ErrRogueDeletion   = errors.New("lockfile owned by me has been removed unexpectedly")
 )
 
 // New describes a new filename located at the given absolute path.
@@ -50,36 +51,35 @@ func New(path string) (Lockfile, error) {
 }
 
 // GetOwner returns who owns the lockfile.
-func (l Lockfile) GetOwner() (*os.Process, error) {
+func (l Lockfile) GetOwner() (int, string, error) {
 	name := string(l)
 
 	// Ok, see, if we have a stale lockfile here
 	content, err := ioutil.ReadFile(name)
 	if err != nil {
-		return nil, err
+		return 0, "", err
 	}
 
 	// try hard for pids. If no pid, the lockfile is junk anyway and we delete it.
-	pid, err := scanPidLine(content)
+	pid, hostname, err := scanPidLine(content)
 	if err != nil {
-		return nil, err
+		return 0, "", err
+	}
+
+	if thishost, _ := os.Hostname(); thishost != hostname {
+		return pid, hostname, ErrBusyOnOtherHost
 	}
 
 	running, err := isRunning(pid)
 	if err != nil {
-		return nil, err
+		return 0, hostname, err
 	}
 
 	if running {
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			return nil, err
-		}
-
-		return proc, nil
+		return pid, hostname, nil
 	}
 
-	return nil, ErrDeadOwner
+	return 0, "", ErrDeadOwner
 }
 
 // TryLock tries to own the lock.
@@ -96,7 +96,11 @@ func (l Lockfile) TryLock() error {
 		panic(ErrNeedAbsPath)
 	}
 
-	tmplock, cleanup, err := makePidFile(name, os.Getpid())
+	thishostname, err := os.Hostname()
+	if err != nil {
+		panic("Could not get hostname of the current host")
+	}
+	tmplock, cleanup, err := makePidFile(name, os.Getpid(), thishostname)
 	if err != nil {
 		return err
 	}
@@ -136,13 +140,13 @@ func (l Lockfile) TryLock() error {
 		return nil
 	}
 
-	proc, err := l.GetOwner()
+	pid, hostname, err := l.GetOwner()
 	switch err {
 	default:
 		// Other errors -> defensively fail and let caller handle this
 		return err
 	case nil:
-		if proc.Pid != os.Getpid() {
+		if (pid != os.Getpid()) && (thishostname == hostname) {
 			return ErrBusy
 		}
 	case ErrDeadOwner, ErrInvalidPid: // cases we can fix below
@@ -163,12 +167,12 @@ func (l Lockfile) TryLock() error {
 
 // Unlock a lock again, if we owned it. Returns any error that happened during release of lock.
 func (l Lockfile) Unlock() error {
-	proc, err := l.GetOwner()
+	pid, _, err := l.GetOwner()
 	switch err {
 	case ErrInvalidPid, ErrDeadOwner:
 		return ErrRogueDeletion
 	case nil:
-		if proc.Pid == os.Getpid() {
+		if pid == os.Getpid() {
 			// we really own it, so let's remove it.
 			return os.Remove(string(l))
 		}
@@ -185,24 +189,26 @@ func (l Lockfile) Unlock() error {
 	}
 }
 
-func scanPidLine(content []byte) (int, error) {
+func scanPidLine(content []byte) (int, string, error) {
 	if len(content) == 0 {
-		return 0, ErrInvalidPid
+		return 0, "", ErrInvalidPid
 	}
 
 	var pid int
-	if _, err := fmt.Sscanln(string(content), &pid); err != nil {
-		return 0, ErrInvalidPid
+	var hostname string
+	// if _, err := fmt.Sscanln(string(content), &pid); err != nil {
+	if _, err := fmt.Sscanf(string(content), "%d,%s\n", &pid, &hostname); err != nil {
+		return 0, "", ErrInvalidPid
 	}
 
 	if pid <= 0 {
-		return 0, ErrInvalidPid
+		return 0, "", ErrInvalidPid
 	}
 
-	return pid, nil
+	return pid, hostname, nil
 }
 
-func makePidFile(name string, pid int) (tmpname string, cleanup func(), err error) {
+func makePidFile(name string, pid int, hostname string) (tmpname string, cleanup func(), err error) {
 	tmplock, err := ioutil.TempFile(filepath.Dir(name), filepath.Base(name)+".")
 	if err != nil {
 		return "", nil, err
@@ -213,7 +219,7 @@ func makePidFile(name string, pid int) (tmpname string, cleanup func(), err erro
 		_ = os.Remove(tmplock.Name())
 	}
 
-	if _, err := io.WriteString(tmplock, fmt.Sprintf("%d\n", pid)); err != nil {
+	if _, err := io.WriteString(tmplock, fmt.Sprintf("%d,%s\n", pid, hostname)); err != nil {
 		cleanup() // Do cleanup here, so call doesn't have to.
 		return "", nil, err
 	}
